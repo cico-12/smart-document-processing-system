@@ -49,6 +49,10 @@ const MONTHS: Record<string, string> = {
   dec: "12",
 };
 
+const MONTH_NAME_PATTERN = Object.keys(MONTHS)
+  .sort((a, b) => b.length - a.length)
+  .join("|");
+
 const STOP_LABELS = [
   "Supplier",
   "Vendor",
@@ -149,8 +153,13 @@ function normalizeOcrText(rawText: string) {
     .replace(/\bT\s*O\s*T\s*A\s*L\b/gi, "Total")
     .replace(/\bINVOICE\s+N0\b/gi, "Invoice No")
     .replace(/\bINVOICE\s+NO\b/gi, "Invoice No")
+    .replace(/\bINVOICE\s+D[4A]TE\b/gi, "Invoice Date")
     .replace(/\bQ\s*TY\b/gi, "Qty")
-    .replace(/\bQUANTIT[YV]\b/gi, "Quantity");
+    .replace(/\bQUANTIT[YV]\b/gi, "Quantity")
+    .replace(/\bCATERGORY\b/gi, "Category")
+    .replace(/\bCATEGOR[YV]\b/gi, "Category")
+    .replace(/\bPRlCE\b/g, "PRICE")
+    .replace(/\bprlce\b/g, "price");
 }
 
 function detectDocumentType(text: string): ExtractedDocument["documentType"] {
@@ -366,13 +375,23 @@ function extractDocumentNumber(text: string, fileName: string) {
   return fileName.replace(/\.[^/.]+$/, "");
 }
 
+function normalizeDateNumberToken(value: string) {
+  return value
+    .replace(/[oO]/g, "0")
+    .replace(/[iIl|]/g, "1")
+    .replace(/[sS]/g, "5")
+    .replace(/[bB]/g, "6");
+}
+
 function normalizeYear(value: string) {
-  if (value.length === 2) {
-    const year = Number(value);
-    return year > 70 ? `19${value}` : `20${value}`;
+  const cleaned = normalizeDateNumberToken(value);
+
+  if (cleaned.length === 2) {
+    const year = Number(cleaned);
+    return year > 70 ? `19${cleaned}` : `20${cleaned}`;
   }
 
-  return value;
+  return cleaned;
 }
 
 function normalizeDate(value?: string) {
@@ -384,7 +403,9 @@ function normalizeDate(value?: string) {
     return trimmed;
   }
 
-  const numericMatch = trimmed.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  const numericMatch = trimmed.match(
+    /^(\d{1,2})[./-](\d{1,2})[./-]([0-9oOiIl|sSbB]{2,4})$/
+  );
 
   if (numericMatch) {
     const [, firstRaw, secondRaw, yearRaw] = numericMatch;
@@ -403,12 +424,15 @@ function normalizeDate(value?: string) {
     return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
   }
 
-  const monthNameMatch = trimmed.match(
-    /^(\d{1,2})[\s-]+([A-Za-z]+)[\s-]+(\d{2,4})$/i
+  const dayMonthYearMatch = trimmed.match(
+    new RegExp(
+      `^(\\d{1,2})[\\s-]+(${MONTH_NAME_PATTERN})[\\s-]+([0-9oOiIl|sSbB]{2,4})$`,
+      "i"
+    )
   );
 
-  if (monthNameMatch) {
-    const [, day, monthRaw, yearRaw] = monthNameMatch;
+  if (dayMonthYearMatch) {
+    const [, day, monthRaw, yearRaw] = dayMonthYearMatch;
     const month = MONTHS[monthRaw.toLowerCase()];
     const year = normalizeYear(yearRaw);
 
@@ -417,33 +441,73 @@ function normalizeDate(value?: string) {
     }
   }
 
-  return trimmed;
+  const monthDayYearMatch = trimmed.match(
+    new RegExp(
+      `^(${MONTH_NAME_PATTERN})[\\s-]+(\\d{1,2})[\\s-]+([0-9oOiIl|sSbB]{2,4})$`,
+      "i"
+    )
+  );
+
+  if (monthDayYearMatch) {
+    const [, monthRaw, day, yearRaw] = monthDayYearMatch;
+    const month = MONTHS[monthRaw.toLowerCase()];
+    const year = normalizeYear(yearRaw);
+
+    if (month) {
+      return `${year}-${month}-${day.padStart(2, "0")}`;
+    }
+  }
+
+  return undefined;
 }
 
 function findDateInText(value: string) {
-  const match = value.match(
-    /\b(\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}[\s-]+[A-Za-z]+[\s-]+\d{2,4})\b/i
-  );
+  const patterns = [
+    /\b(\d{4}-\d{2}-\d{2})\b/i,
+    /\b(\d{1,2}[./-]\d{1,2}[./-][0-9oOiIl|sSbB]{2,4})\b/i,
+    new RegExp(
+      `\\b(\\d{1,2}[\\s-]+(?:${MONTH_NAME_PATTERN})[\\s-]+[0-9oOiIl|sSbB]{2,4})\\b`,
+      "i"
+    ),
+    new RegExp(
+      `\\b((?:${MONTH_NAME_PATTERN})[\\s-]+\\d{1,2}[\\s-]+[0-9oOiIl|sSbB]{2,4})\\b`,
+      "i"
+    ),
+  ];
 
-  return match?.[1];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  return undefined;
 }
 
 function extractDateValue(text: string, labels: string[]) {
   const compactText = cleanValue(text);
 
-  const datePattern =
-    String.raw`(\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}[\s-]+[A-Za-z]+[\s-]+\d{2,4})`;
+  const datePatterns = [
+    String.raw`(\d{4}-\d{2}-\d{2})`,
+    String.raw`(\d{1,2}[./-]\d{1,2}[./-][0-9oOiIl|sSbB]{2,4})`,
+    String.raw`(\d{1,2}[\s-]+(?:${MONTH_NAME_PATTERN})[\s-]+[0-9oOiIl|sSbB]{2,4})`,
+    String.raw`((?:${MONTH_NAME_PATTERN})[\s-]+\d{1,2}[\s-]+[0-9oOiIl|sSbB]{2,4})`,
+  ];
 
   for (const label of labels) {
-    const pattern = new RegExp(
-      `${labelToRegex(label)}\\s*[:\\-]?\\s*${datePattern}`,
-      "i"
-    );
+    for (const datePattern of datePatterns) {
+      const pattern = new RegExp(
+        `${labelToRegex(label)}\\s*[:\\-]?\\s*${datePattern}`,
+        "i"
+      );
 
-    const match = compactText.match(pattern);
+      const match = compactText.match(pattern);
 
-    if (match?.[1]) {
-      return cleanValue(match[1]);
+      if (match?.[1]) {
+        return cleanValue(match[1]);
+      }
     }
   }
 
@@ -461,13 +525,55 @@ function extractDateValue(text: string, labels: string[]) {
         return sameLineDate;
       }
 
-      for (let offset = 1; offset <= 3; offset += 1) {
+      for (let offset = 1; offset <= 5; offset += 1) {
         const nextLineDate = findDateInText(lines[index + offset] ?? "");
 
         if (nextLineDate) {
           return nextLineDate;
         }
       }
+    }
+  }
+
+  return undefined;
+}
+
+function extractFallbackDate(text: string) {
+  const lines = getCleanLines(text);
+
+  const preferredIndex = lines.findIndex((line) => {
+    return /\binvoice\b/i.test(line) && /\bdate\b/i.test(line);
+  });
+
+  if (preferredIndex >= 0) {
+    for (let index = preferredIndex; index <= preferredIndex + 5; index += 1) {
+      const date = findDateInText(lines[index] ?? "");
+
+      if (date) {
+        return date;
+      }
+    }
+  }
+
+  const dateLabelIndex = lines.findIndex((line) => {
+    return /\bdate\b/i.test(line) && !/\bdue\b/i.test(line);
+  });
+
+  if (dateLabelIndex >= 0) {
+    for (let index = dateLabelIndex; index <= dateLabelIndex + 5; index += 1) {
+      const date = findDateInText(lines[index] ?? "");
+
+      if (date) {
+        return date;
+      }
+    }
+  }
+
+  for (const line of lines.slice(0, 25)) {
+    const date = findDateInText(line);
+
+    if (date) {
+      return date;
     }
   }
 
@@ -498,10 +604,17 @@ function extractLineNumbers(value: string) {
 
   for (const match of value.matchAll(numberPattern)) {
     const raw = match[0];
-    const endIndex = (match.index ?? 0) + raw.length;
+    const startIndex = match.index ?? 0;
+    const endIndex = startIndex + raw.length;
+
+    const previousCharacter = value.slice(Math.max(0, startIndex - 1), startIndex);
     const nextCharacter = value.slice(endIndex, endIndex + 1);
 
     if (nextCharacter === "%") continue;
+
+    if (/[A-Za-z]/.test(previousCharacter) || /[A-Za-z]/.test(nextCharacter)) {
+      continue;
+    }
 
     const parsed = parseMoney(raw);
 
@@ -676,6 +789,34 @@ function cleanItemDescription(value: string) {
     .replace(/\s+adipiscing.*$/i, "")
     .replace(/[.:,;]+$/, "")
     .trim();
+}
+
+function normalizeTitleSpacing(value: string) {
+  return value
+    // BusinessCard -> Business Card
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    // D esign -> Design
+    .replace(/\b([A-Z])\s+([a-z]{2,})\b/g, "$1$2")
+    // Flyer D esign -> Flyer Design
+    .replace(/\b([A-Z][a-z]{2,})\s+([A-Z])\s+([a-z]{2,})\b/g, "$1 $2$3")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanTitleCandidate(value: string) {
+  return normalizeTitleSpacing(cleanItemDescription(value))
+    .replace(
+      /\b(?:Lorem|Ipsum|Dolor|Sit|Amet|Consectetur|Adipiscing|Elit|Elitsse|Cond|Vestibulum|Viverra|Egestas|Tellus|Interdum)\b.*$/i,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isDescriptionNoiseWord(value: string) {
+  return /^(lorem|ipsum|dolor|sit|amet|consectetur|consect|nsect|sectetur|adipiscing|adipis|dipiscing|elit|elitsse|cond|vestibulum|viverra|egestas|tellus|interdum|iment|radi|amet)$/i.test(
+    value
+  );
 }
 
 function isLikelyQuantity(value: number) {
@@ -941,25 +1082,26 @@ function getTableBlock(text: string): TableBlock | null {
 }
 
 function isLikelyItemTitle(line: string) {
-  const cleaned = cleanItemDescription(line);
+  const cleaned = cleanTitleCandidate(line);
 
   if (!cleaned) return false;
   if (cleaned.length < 3) return false;
   if (TABLE_END_PATTERN.test(cleaned)) return false;
 
   if (
-    /\b(category|description|product\s+name|qty|quantity|rate|unit\s+price|price|amount|total)\b/i.test(
+    /\b(category|description|product\s+name|qty|quantity|rate|unit\s+price|price|amount|total|subtotal)\b/i.test(
       cleaned
     )
   ) {
     return false;
   }
 
-  if (
-    /\b(lorem|ipsum|consectetur|adipiscing|vestibulum|terms|conditions|payment|bank|phone|email|www|http|thank you)\b/i.test(
-      cleaned
-    )
-  ) {
+  const words = cleaned.split(/\s+/).filter(Boolean);
+
+  if (!words.length) return false;
+  if (words.length > 5) return false;
+
+  if (words.some(isDescriptionNoiseWord)) {
     return false;
   }
 
@@ -967,11 +1109,85 @@ function isLikelyItemTitle(line: string) {
 
   const numbers = extractLineNumbers(cleaned);
 
-  if (numbers.length >= 2) {
+  if (numbers.length) {
     return false;
   }
 
-  return /[A-Za-z]/.test(cleaned);
+  const lettersOnly = cleaned.replace(/[^A-Za-z]/g, "");
+
+  if (lettersOnly.length < 4) {
+    return false;
+  }
+
+  const hasTitleLikeWord = words.some((word) =>
+    /^[A-Z][A-Za-z&'’-]{2,}$/.test(word)
+  );
+
+  if (!hasTitleLikeWord) {
+    return false;
+  }
+
+  return true;
+}
+function extractLeadingTitleFromNoisyLine(line: string) {
+  const normalizedLine = normalizeTitleSpacing(line);
+
+  // Do not extract titles from lowercase continuation text like:
+  // "nsectetur adipiscing..." or "imentum egestas..."
+  if (!/^[A-Z]/.test(normalizedLine)) {
+    return undefined;
+  }
+
+  const beforeDescription = normalizedLine
+    .split(
+      /\b(?:lorem|ipsum|dolor|sit|amet|consectetur|adipiscing|elit|elitsse|cond|vestibulum|viverra|egestas|tellus|interdum)\b/i
+    )[0]
+    .replace(/\s+[$€£₹]?\d[\d.,]*(?:\s|$).*$/g, " ")
+    .trim();
+
+  const words = cleanValue(beforeDescription).split(/\s+/).filter(Boolean);
+  const titleWords: string[] = [];
+
+  for (const word of words) {
+    const cleanedWord = word.replace(/^[^A-Za-z]+|[^A-Za-z&'’-]+$/g, "");
+
+    if (!cleanedWord) continue;
+
+    if (isDescriptionNoiseWord(cleanedWord)) {
+      break;
+    }
+
+    if (
+      /^(category|description|product|item|qty|quantity|rate|unit|price|amount|total|subtotal)$/i.test(
+        cleanedWord
+      )
+    ) {
+      break;
+    }
+
+    if (/^[A-Z][A-Za-z&'’-]{2,}$/.test(cleanedWord)) {
+      titleWords.push(cleanedWord);
+      continue;
+    }
+
+    if (titleWords.length) {
+      break;
+    }
+  }
+
+  const title = cleanTitleCandidate(titleWords.slice(0, 4).join(" "));
+
+  return isLikelyItemTitle(title) ? title : undefined;
+}
+
+function extractItemTitlesFromLine(line: string) {
+  const title = extractLeadingTitleFromNoisyLine(line);
+
+  if (!title) {
+    return [];
+  }
+
+  return [title];
 }
 
 function parseTableLines(lines: string[], headerColumns: HeaderColumn[]) {
@@ -999,8 +1215,8 @@ function parseTableLines(lines: string[], headerColumns: HeaderColumn[]) {
 
       if (description) {
         const item =
-          mapLineItemByHeader(description, numbers, headerColumns) ??
-          inferLineItem(description, numbers);
+          inferLineItem(description, numbers) ??
+          mapLineItemByHeader(description, numbers, headerColumns);
 
         if (item) {
           items.push(item);
@@ -1012,8 +1228,8 @@ function parseTableLines(lines: string[], headerColumns: HeaderColumn[]) {
 
     if (pendingDescription && numbers.length >= 3) {
       const item =
-        mapLineItemByHeader(pendingDescription, numbers, headerColumns) ??
-        inferLineItem(pendingDescription, numbers);
+        inferLineItem(pendingDescription, numbers) ??
+        mapLineItemByHeader(pendingDescription, numbers, headerColumns);
 
       if (item) {
         items.push(item);
@@ -1022,8 +1238,15 @@ function parseTableLines(lines: string[], headerColumns: HeaderColumn[]) {
       }
     }
 
+    const titleCandidates = extractItemTitlesFromLine(line);
+
+    if (titleCandidates.length) {
+      pendingDescription = titleCandidates.at(-1);
+      continue;
+    }
+
     if (isLikelyItemTitle(line)) {
-      pendingDescription = cleanItemDescription(line);
+      pendingDescription = cleanTitleCandidate(line);
     }
   }
 
@@ -1034,16 +1257,16 @@ function getTableItemTitles(lines: string[]) {
   const titles: string[] = [];
 
   for (const line of lines) {
-    const title = cleanItemDescription(line);
+    const lineTitles = extractItemTitlesFromLine(line);
 
-    if (!isLikelyItemTitle(title)) continue;
+    for (const title of lineTitles) {
+      const alreadyExists = titles.some(
+        (existing) => existing.toLowerCase() === title.toLowerCase()
+      );
 
-    const alreadyExists = titles.some(
-      (existing) => existing.toLowerCase() === title.toLowerCase()
-    );
-
-    if (!alreadyExists) {
-      titles.push(title);
+      if (!alreadyExists) {
+        titles.push(title);
+      }
     }
   }
 
@@ -1068,6 +1291,18 @@ function getExpectedItemCountFromTable(block: TableBlock) {
   const numericColumns = getNumericHeaderColumns(block.headerColumns);
   const numbers = getTableNumbers(block.bodyLines);
   const titles = getTableItemTitles(block.bodyLines);
+
+  const moneyValueCount = block.bodyLines.flatMap(extractMoneyValues).length;
+  const quantityCount = block.bodyLines.flatMap(extractStandaloneQuantities).length;
+
+  const separatedColumnCount = Math.min(
+    quantityCount,
+    Math.floor(moneyValueCount / 2)
+  );
+
+  if (separatedColumnCount >= 2) {
+    return separatedColumnCount;
+  }
 
   if (
     numericColumns.length >= 3 &&
@@ -1117,8 +1352,8 @@ function buildItemsFromRowMajorNumbers(
     }
 
     const item =
-      mapLineItemByHeader(titles[index], values, headerColumns) ??
-      inferLineItem(titles[index], values);
+      inferLineItem(titles[index], values) ??
+      mapLineItemByHeader(titles[index], values, headerColumns);
 
     if (item) {
       items.push(item);
@@ -1155,8 +1390,8 @@ function buildItemsFromColumnMajorNumbers(
     });
 
     const item =
-      mapLineItemByHeader(titles[rowIndex], values, headerColumns) ??
-      inferLineItem(titles[rowIndex], values);
+      inferLineItem(titles[rowIndex], values) ??
+      mapLineItemByHeader(titles[rowIndex], values, headerColumns);
 
     if (item) {
       items.push(item);
@@ -1269,18 +1504,173 @@ function extractHeaderAwareLineItemsFromBlock(block: TableBlock) {
   return pickBestLineItems([rowMajorItems, columnMajorItems], expectedCount);
 }
 
+function isTableColumnLabelLine(line: string) {
+  const withoutLabels = cleanValue(line)
+    .replace(
+      /\b(category|categ\w*|description|product\s+name|item|qty|quantity|rate|unit\s+price|price|amount|line\s+total|total)\b/gi,
+      ""
+    )
+    .trim();
+
+  return withoutLabels.length === 0;
+}
+
+function getLooseTableLines(text: string) {
+  const lines = getCleanLines(text);
+
+  const startIndex = lines.findIndex((line) => {
+    return (
+      /\bcateg\w*\b/i.test(line) ||
+      /\bdescription\b/i.test(line) ||
+      /\bproduct\s+name\b/i.test(line) ||
+      /\bitem\b/i.test(line)
+    );
+  });
+
+  if (startIndex < 0) {
+    return [];
+  }
+
+  let endIndex = lines.length;
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    if (TABLE_END_PATTERN.test(lines[index])) {
+      endIndex = index;
+      break;
+    }
+  }
+
+  return lines.slice(startIndex + 1, endIndex);
+}
+
+function extractMoneyValues(value: string) {
+  const values: number[] = [];
+
+  const moneyPattern =
+    /(?:[$€£₹]\s*)?\d+(?:,\d{3})*(?:[.,]\d{2})(?:\s*(?:USD|EUR|BAM|GBP|AED|INR|KM))?/gi;
+
+  for (const match of value.matchAll(moneyPattern)) {
+    const parsed = parseMoney(match[0]);
+
+    if (typeof parsed === "number" && parsed >= 0) {
+      values.push(parsed);
+    }
+  }
+
+  return values;
+}
+
+function extractStandaloneQuantities(value: string) {
+  const values: number[] = [];
+
+  for (const match of value.matchAll(/\b0?\d{1,3}\b/g)) {
+    const raw = match[0];
+    const startIndex = match.index ?? 0;
+    const endIndex = startIndex + raw.length;
+
+    const previousCharacter = value.slice(Math.max(0, startIndex - 1), startIndex);
+    const nextCharacter = value.slice(endIndex, endIndex + 1);
+
+    if (previousCharacter === "." || previousCharacter === ",") continue;
+    if (nextCharacter === "." || nextCharacter === ",") continue;
+    if (previousCharacter === "/" || nextCharacter === "/") continue;
+    if (previousCharacter === "-" || nextCharacter === "-") continue;
+    if (/[A-Za-z$€£₹]/.test(previousCharacter)) continue;
+    if (/[A-Za-z%]/.test(nextCharacter)) continue;
+
+    const quantity = Number(raw);
+
+    if (isLikelyQuantity(quantity)) {
+      values.push(quantity);
+    }
+  }
+
+  return values;
+}
+
+function extractSeparatedColumnLineItems(
+  lines: string[],
+  expectedCount?: number
+) {
+  const usableLines = lines.filter((line) => {
+    if (!line) return false;
+    if (TABLE_END_PATTERN.test(line)) return false;
+    if (isTableColumnLabelLine(line)) return false;
+
+    return true;
+  });
+
+  const titles = getTableItemTitles(usableLines);
+  const moneyValues = usableLines.flatMap(extractMoneyValues);
+  const quantities = usableLines.flatMap(extractStandaloneQuantities);
+
+  const detectedCount = Math.min(
+    titles.length,
+    quantities.length,
+    Math.floor(moneyValues.length / 2)
+  );
+
+  const rowCount = Math.min(expectedCount ?? detectedCount, detectedCount);
+
+  if (rowCount <= 0) {
+    return [];
+  }
+
+  const limitedTitles = titles.slice(0, rowCount);
+  const limitedQuantities = quantities.slice(0, rowCount);
+
+  const rowMajorItems: LineItem[] = [];
+
+  for (let index = 0; index < rowCount; index += 1) {
+    const item = {
+      description: limitedTitles[index],
+      quantity: limitedQuantities[index],
+      unitPrice: moneyValues[index * 2],
+      amount: moneyValues[index * 2 + 1],
+    };
+
+    if (isValidLineItem(item)) {
+      rowMajorItems.push(item);
+    }
+  }
+
+  const columnMajorItems: LineItem[] = [];
+
+  for (let index = 0; index < rowCount; index += 1) {
+    const item = {
+      description: limitedTitles[index],
+      quantity: limitedQuantities[index],
+      unitPrice: moneyValues[index],
+      amount: moneyValues[rowCount + index],
+    };
+
+    if (isValidLineItem(item)) {
+      columnMajorItems.push(item);
+    }
+  }
+
+  return pickBestLineItems([rowMajorItems, columnMajorItems], rowCount);
+}
+
 function extractLineItemsFromTable(text: string): LineItem[] {
   const block = getTableBlock(text);
 
   if (!block) {
-    return [];
+    return extractSeparatedColumnLineItems(getLooseTableLines(text));
   }
 
   const expectedCount = getExpectedItemCountFromTable(block);
   const directRowItems = parseTableLines(block.bodyLines, block.headerColumns);
   const headerAwareItems = extractHeaderAwareLineItemsFromBlock(block);
+  const separatedColumnItems = extractSeparatedColumnLineItems(
+    block.bodyLines,
+    expectedCount
+  );
 
-  return pickBestLineItems([directRowItems, headerAwareItems], expectedCount);
+  return pickBestLineItems(
+    [directRowItems, headerAwareItems, separatedColumnItems],
+    expectedCount
+  );
 }
 
 function normalizeExtractedMoney(
@@ -1383,7 +1773,7 @@ export function parseTextLikeDocument(
       "Date de Facturation",
       "Dated",
       "Date",
-    ])
+    ]) ?? extractFallbackDate(text)
   );
 
   const dueDate = normalizeDate(
