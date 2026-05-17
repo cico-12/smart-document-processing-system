@@ -3,6 +3,8 @@ WORKDIR /app
 
 RUN apk add --no-cache libc6-compat
 
+ENV NEXT_TELEMETRY_DISABLED=1
+
 FROM base AS deps
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -10,8 +12,6 @@ RUN npm ci
 FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
-ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
 
